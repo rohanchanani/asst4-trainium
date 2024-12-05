@@ -67,12 +67,56 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
+    c_out_pmax = nl.tile_size.pmax
+    n_tiles_c_out = out_channels // c_out_pmax
+    height_max = 128 - filter_height
+    width_max = 128-filter_width
+    n_tiles_height = (out_height+(height_max-1)) // height_max
+    n_tiles_width = (out_width+(width_max-1)) // width_max
+    actual_height = (out_height // n_tiles_height)
+    while actual_height % pool_size != 0:
+        actual_height+=1
+    actual_width = (out_width // n_tiles_width)
 
+    print(f"Actual: {actual_height}, Total: {out_height}, Num Tiles: {n_tiles_height}")
+
+
+
+    weights = nl.ndarray(shape=(n_tiles_c_out, c_out_pmax, n_tiles_c_in, nl.par_dim(c_in_pmax), filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+    
+    for i in nl.affine_range(n_tiles_c_in):
+        for j in nl.affine_range(n_tiles_c_out):
+            for k in nl.affine_range(c_out_pmax):
+                weights[j, k, i, :, :, :] = nl.load(W[j*c_out_pmax+k, i*c_in_pmax:(i+1)*c_in_pmax, :,:])
+    
+    prepared_weights = nl.ndarray(shape=(filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_in_pmax), c_out_pmax), dtype=W.dtype, buffer=nl.sbuf)
+    for i in nl.affine_range(n_tiles_c_out):
+        for j in nl.affine_range(n_tiles_c_in):
+            for k in nl.affine_range(c_out_pmax):
+                for m in nl.affine_range(filter_height):
+                    for n in nl.affine_range(filter_width):
+                        prepared_weights[m, n, i, j, :, k] = nl.copy(weights[i, k, j, :, m, n])
+
+    
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        # TODO: Perform the convolution of X[b] with the weights W and bias b, followed by a maxpool
-        # and store the result in X_out[b]
-        continue
+        for a in nl.affine_range(n_tiles_height):
+            img = nl.ndarray(shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), actual_height+filter_height-1, input_width), dtype=X.dtype, buffer=nl.sbuf)
+            for i in nl.affine_range(n_tiles_c_in):
+                i_p = a*actual_height + nl.arange(actual_height+filter_height-1)[None, None, :, None]
+                img[i, :, :, :] = nl.load(X[b, i*c_in_pmax:(i+1)*c_in_pmax, a*actual_height:(a+1)*actual_height+filter_height-1, :], mask=i_p<input_height)
+
+        
+            for i in nl.affine_range(n_tiles_c_out):
+                curr_output = nl.ndarray(shape=(nl.par_dim(c_out_pmax), actual_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                for curr_row in nl.affine_range(actual_height):
+                    output_row = nl.zeros(shape=(c_out_pmax,out_width), dtype=X.dtype, buffer=nl.psum)
+                    for y in nl.affine_range(filter_height):
+                        for x in nl.affine_range(filter_width):
+                            for j in nl.affine_range(n_tiles_c_in):
+                                output_row[:, :]+=nl.matmul(prepared_weights[y, x, i, j, :, :], img[j, :, curr_row+y, x:x+out_width], transpose_x=True)
+                    curr_output[:,curr_row, :] = nl.copy(output_row)
+                nl.store(X_out[b, i*c_out_pmax:(i+1)*c_out_pmax, a*actual_height:(a+1)*actual_height, :], value=curr_output[...])
 
     return X_out
 
