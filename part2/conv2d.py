@@ -112,7 +112,14 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                                 output_row[:, :]+=nl.matmul(prepared_weights[y, x, i, j, :, :], img[j, :, curr_row+y, x:x+out_width], transpose_x=True)
                     output_row = nisa.tensor_scalar(output_row, nl.add, bias_buf[i])
                     curr_output[:,curr_row, :] = nl.copy(output_row)    
-                nl.store(X_out[b, i*c_out_pmax:(i+1)*c_out_pmax, a*actual_height:(a+1)*actual_height, :], value=curr_output[...])
+                if pool_size>1:
+                    result = nl.ndarray((nl.par_dim(c_out_pmax), (input_width//2-1), 4), dtype=curr_output.dtype, buffer=nl.sbuf)
+                    for k in nl.affine_range((input_width//2)-1):
+                        result[:,k,0:2] = nl.copy(curr_output[:,0,2*k:2*(k+1)])
+                        result[:,k,2:4] = nl.copy(curr_output[:,1,2*k:2*(k+1)])
+                    curr_output = nl.max(result, axis=2).reshape((c_out_pmax, 1, input_width//2-1))
+
+                nl.store(X_out[b, i*c_out_pmax:(i+1)*c_out_pmax, a*(actual_height//pool_size):(a+1)*(actual_height//pool_size), :], value=curr_output[...])
 
     return X_out
 
